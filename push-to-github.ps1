@@ -48,8 +48,9 @@ if ($existing -notcontains "origin") {
     Step "添加远端 origin"
     git remote add origin $Remote
 } else {
-    Step "更新远端 origin"
-    git remote set-url origin $Remote
+    # 已有 origin（可能是 SSH 形式）就别乱改，尊重仓库现有配置
+    $current = (git remote get-url origin) 2>$null
+    Step "远端已存在，保持不动：$current"
 }
 
 # 4) 推送（这里会弹浏览器授权）
