@@ -47,6 +47,14 @@ String? _hintFor(String code, String message) {
   if (all.contains('timeout') || all.contains('Timeout')) {
     return '网络超时，检查手机网络后重试';
   }
+  if (all.contains('connection abort') ||
+      all.contains('Connection closed') ||
+      all.contains('Connection reset') ||
+      all.contains('Software caused') ||
+      all.contains('SocketException') ||
+      all.contains('ClientException')) {
+    return '网络连接被中断（不是 Key 的问题）。正在自动重试；如果一直失败，切一下 Wi-Fi/流量再试。';
+  }
   return null;
 }
 
@@ -173,6 +181,12 @@ class DashScope {
       throw DashScopeException('NetworkTimeout', '提交任务超时', '检查手机网络后重试');
     } on SocketException catch (e) {
       throw DashScopeException('NetworkError', e.message, '手机连不上该服务地址，检查网络/域名');
+    } on http.ClientException catch (e) {
+      throw DashScopeException(
+        'NetworkAbort',
+        e.message,
+        '连接被中断，任务可能没提交成功（没扣费或已扣费都可能，别连点重试）。切一下网络再试。',
+      );
     }
 
     Map<String, dynamic>? body;
@@ -201,16 +215,33 @@ class DashScope {
   }) async {
     final started = DateTime.now();
     var lastStatus = 'PENDING';
+    var netFails = 0;
+    var lastNetError = '';
     while (DateTime.now().difference(started) < timeout) {
       await Future<void>.delayed(const Duration(seconds: 6));
       final elapsed = DateTime.now().difference(started).inSeconds;
       http.Response res;
       try {
-        res = await _client
-            .get(Uri.parse('$_base/tasks/$taskId'), headers: _headers(apiKey))
-            .timeout(const Duration(seconds: 40));
+        res = await _pollOnce(apiKey, taskId);
+        netFails = 0;
       } on TimeoutException {
         onTick?.call(lastStatus, elapsed);
+        continue;
+      } catch (e) {
+        // 网络抖动，或者 keep-alive 连接被服务端掐断
+        // （典型报错：Connection reset / Software caused connection abort）
+        // 轮询是幂等的，重试就行，别把整个镜头判失败
+        netFails++;
+        lastNetError = e.toString();
+        onTick?.call(lastStatus, elapsed);
+        if (netFails >= 10) {
+          throw DashScopeException(
+            'NetworkAbort',
+            '连续 $netFails 次拉不到任务状态：$lastNetError',
+            '任务可能还在后台生成（task_id $taskId）。切一下 Wi-Fi/流量后重试，别重新提交新任务。',
+          );
+        }
+        await Future<void>.delayed(Duration(seconds: netFails * 2));
         continue;
       }
       Map<String, dynamic>? body;
@@ -248,34 +279,85 @@ class DashScope {
     );
   }
 
+  /// 单次拉取任务状态：每次都用**新连接**并声明 Connection: close，
+  /// 避免复用到已经被服务端关掉的 keep-alive 连接（否则首轮轮询就容易 abort）
+  Future<http.Response> _pollOnce(String apiKey, String taskId) async {
+    const timeout = Duration(seconds: 40);
+    final client = http.Client();
+    try {
+      final req = http.Request('GET', Uri.parse('$_base/tasks/$taskId'));
+      req.headers.addAll(_headers(apiKey));
+      req.headers['Connection'] = 'close';
+      final streamed = await client.send(req).timeout(timeout);
+      return await http.Response.fromStream(streamed).timeout(timeout);
+    } finally {
+      client.close();
+    }
+  }
+
   /// 下载视频到本地文件，返回字节数
   Future<int> downloadTo({
     required String url,
     required String filePath,
     void Function(int received, int total)? onProgress,
   }) async {
-    final req = http.Request('GET', Uri.parse(url));
-    final streamed = await _client.send(req);
-    if (streamed.statusCode != 200) {
-      throw DashScopeException(
-        'DownloadFailed',
-        'HTTP ${streamed.statusCode}',
-        '视频链接可能已过期，重新生成一次',
-      );
+    // 大文件下载也用独立连接 + 最多重试 3 次，手机网络抖一下就整条失败太浪费钱
+    Object? lastError;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      final client = http.Client();
+      var sinkOpen = false;
+      final file = File(filePath);
+      IOSink? sink;
+      try {
+        await file.parent.create(recursive: true);
+        final req = http.Request('GET', Uri.parse(url))
+          ..headers['Connection'] = 'close';
+        final streamed = await client
+            .send(req)
+            .timeout(const Duration(seconds: 60));
+        if (streamed.statusCode != 200) {
+          throw DashScopeException(
+            'DownloadFailed',
+            'HTTP ${streamed.statusCode}',
+            '视频链接可能已过期，重新生成一次',
+          );
+        }
+        final total = streamed.contentLength ?? 0;
+        sink = file.openWrite();
+        sinkOpen = true;
+        var received = 0;
+        await for (final chunk in streamed.stream) {
+          sink.add(chunk);
+          received += chunk.length;
+          onProgress?.call(received, total);
+        }
+        await sink.flush();
+        await sink.close();
+        sinkOpen = false;
+        return received;
+      } catch (e) {
+        lastError = e;
+        if (e is DashScopeException) rethrow; // 比如 404 过期，重试没意义
+        if (sinkOpen) {
+          try {
+            await sink?.close();
+          } catch (_) {
+            // ignore
+          }
+        }
+        if (attempt < 2) {
+          await Future<void>.delayed(Duration(seconds: 2 * (attempt + 1)));
+          continue;
+        }
+      } finally {
+        client.close();
+      }
     }
-    final total = streamed.contentLength ?? 0;
-    final file = File(filePath);
-    await file.parent.create(recursive: true);
-    final sink = file.openWrite();
-    var received = 0;
-    await for (final chunk in streamed.stream) {
-      sink.add(chunk);
-      received += chunk.length;
-      onProgress?.call(received, total);
-    }
-    await sink.flush();
-    await sink.close();
-    return received;
+    throw DashScopeException(
+      'DownloadFailed',
+      '下载中断 $lastError',
+      '网络不稳。视频已在云端生成好（可重新点这个镜头「重新生成」重下，注意会再计费一次），或换网络重试。',
+    );
   }
 
   // ---------------------------------------------------------------------------
